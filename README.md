@@ -14,7 +14,7 @@ This userscript keeps only the last _N_ turns visible, reveals older messages sm
 
 ## Why
 
-Long ChatGPT threads (90k–100k tokens) can make Chrome unusable — typing lags, scrolling freezes, and you get _“Page Unresponsive”_.  
+Long ChatGPT threads (60k–100k tokens) can make Chrome unusable — typing lags, scrolling freezes, and you get _“Page Unresponsive”_.  
 **Lazy Chat++** virtualizes the chat intelligently so you can keep working in the same thread without heavy UI jank.
 
 **Different from common extensions:**
