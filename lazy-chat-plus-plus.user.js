@@ -3,7 +3,7 @@
 // @namespace    chatgpt-lazy
 // @version      1.0
 // @description  Keeps only the last N chat turns visible with smooth upward reveal. Stream-safe virtualization (no heavy work while generating). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
-// @author       Alex S Hamilton
+// @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
 // @supportURL   https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus/issues
 // @match        https://chatgpt.com/*
