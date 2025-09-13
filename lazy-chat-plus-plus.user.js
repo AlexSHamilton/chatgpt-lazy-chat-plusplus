@@ -6,6 +6,8 @@
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
 // @supportURL   https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus/issues
+// @downloadURL  https://raw.githubusercontent.com/AlexSHamilton/chatgpt-lazy-chat-plusplus/main/lazy-chat-plus-plus.user.js
+// @updateURL    https://raw.githubusercontent.com/AlexSHamilton/chatgpt-lazy-chat-plusplus/main/lazy-chat-plus-plus.user.js
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @run-at       document-end
