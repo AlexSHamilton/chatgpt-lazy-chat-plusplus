@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Lazy Chat++ (stream-safe + tokens badge)
 // @namespace    chatgpt-lazy
-// @version      1.0
+// @version      1.0.1
 // @description  Keeps only the last N chat turns visible with smooth upward reveal. Stream-safe virtualization (no heavy work while generating). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
@@ -34,7 +34,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
- 
+
 (function () {
   'use strict';
 
@@ -88,10 +88,13 @@
   let streamFlipTimer = null;
   let softJobScheduled = false;
 
+  // Track current URL (SPA navigation)
+  let lastURL = location.href;
+
   // ====== Token estimator (≈ 1.3 × spaces) ======
   const TOKEN_RATIO = 1.3;               // 1 word ≈ 1.3 tokens; tokens ≈ 1.3 × spaces
   const TOKENS_PER_TICK = 20;            // nodes to compute per tick when missing cache
-  const tokenCache = new WeakMap();      // WeakMap<Node, {tokens:number, dirty?:boolean}>
+  let tokenCache = new WeakMap();        // NOTE: let (so we can reset on URL change)
   const lastTokens = { visible: null, total: null };
   let wantTokensVisible = false, wantTokensTotal = false, tokenJobQueued = false;
 
@@ -477,6 +480,50 @@
     }
   }
 
+  // ====== URL change reset ======
+  function resetForNewChat() {
+    // Drop any marks in current DOM (just in case)
+    clearMarksAll();
+
+    // Reset core state
+    expanded = false;
+    visibleCount = BATCH;
+    isRevealing = false;
+
+    // Detach/archive store — forget old nodes
+    hiddenStore.length = 0;
+
+    // Scroll container will be resolved on next apply
+    scrollContainer = null;
+    scrollAttachedTo = null;
+
+    // Reset metrics so apply() definitely runs
+    lastMetrics = { total: -1, desiredVisible: -1, mode: MODE, expanded };
+
+    // Streaming flags/timers
+    isStreaming = false;
+    if (streamFlipTimer) { clearTimeout(streamFlipTimer); streamFlipTimer = null; }
+    softJobScheduled = false;
+
+    // Tokens: clear cache & last values
+    tokenCache = new WeakMap();
+    lastTokens.visible = null;
+    lastTokens.total = null;
+    wantTokensVisible = false;
+    wantTokensTotal = false;
+    tokenJobQueued = false;
+
+    // Re-attach observer to the new feed root
+    attachObserver(pickFeedRoot());
+
+    // Apply fresh collapsed view and recalc visible tokens
+    apply({ preserveAnchor: false, force: true });
+    scheduleTokens('visible');
+
+    // Scroll to the bottom of the new chat
+    requestAnimationFrame(scrollToBottom);
+  }
+
   // ====== Observe & boot ======
   function recomputeStreamingFlag() {
     const hard = hasStopButton();
@@ -542,9 +589,17 @@
     // Periodic Stop-button polling (cheap & robust)
     setInterval(recomputeStreamingFlag, 300);
 
-    // SPA/pending init poll
+    // SPA/pending init poll + URL change detection
     let tries = 80;
     const poll = setInterval(() => {
+      // Detect URL change (SPA navigation) and reset all state
+      if (location.href !== lastURL) {
+        lastURL = location.href;
+        resetForNewChat();
+        // fresh boot for the new chat, skip the rest of this tick
+        return;
+      }
+
       const root = pickFeedRoot();
       if (root && root !== observerRoot) attachObserver(root);
       recomputeStreamingFlag();
