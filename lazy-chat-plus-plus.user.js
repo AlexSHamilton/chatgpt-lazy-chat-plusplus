@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Lazy Chat++ (stream-safe + tokens badge)
 // @namespace    chatgpt-lazy
-// @version      1.0.1
+// @version      1.0.3
 // @description  Keeps only the last N chat turns visible with smooth upward reveal. Stream-safe virtualization (no heavy work while generating). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
@@ -20,40 +20,30 @@
 /*!
  * ChatGPT Lazy Chat++ — Userscript
  * Copyright (C) 2025 Alex S Hamilton
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 (function () {
   'use strict';
 
   // ====== Settings ======
-  const MODE = 'detach';            // 'hide' | 'detach' | 'cv'  (mode label on the button is replaced by T://)
-  const BATCH = 8;                  // upward auto-reveal batch size
+  const MODE = 'detach';            // 'hide' | 'detach' | 'cv'
+  const BATCH = 8;
   const OBS_DEBOUNCE_MS = 250;
-  const TOP_REVEAL_THRESHOLD = 120; // px from top to trigger reveal
+  const TOP_REVEAL_THRESHOLD = 120;
   const BTN_ID = 'cgpt-lazy-btn';
 
-  // Stream safety
-  const STREAM_SAFE = true;          // do not run heavy detach/anchor/large loops while streaming
-  const STREAM_OFF_COOLDOWN = 500;   // after the Stop button disappears, wait a bit before full processing
+  // Stream-safety & chunking
+  const STREAM_SAFE = true;
+  const STREAM_OFF_COOLDOWN = 500;
+  const MAX_DETACH_PER_TICK = 50;
+  const STREAM_SOFT_CHUNK   = 40;
 
-  // Anti-freeze chunking
-  const MAX_DETACH_PER_TICK = 50;    // how many nodes to detach per tick (after streaming)
-  const STREAM_SOFT_CHUNK   = 40;    // how many nodes to mark with .cv per tick (during streaming)
+  // Full navigation policy on any in-domain URL change
+  const FORCE_FULL_NAV = true;
+  const RELOAD_GUARD_KEY = 'cgpt-lazy-fullnav';
+  const RELOAD_GUARD_MS  = 5000; // guard against loops for the same URL
 
-  // Selectors
+  // Turn containers
   const TURN_SELECTOR = [
     '[data-testid^="conversation-turn"]',
     'article[data-turn-id]',
@@ -62,7 +52,7 @@
     'li[data-testid^="conversation-turn"]'
   ].join(',');
 
-  // "Stop streaming" button — primary streaming flag
+  // Streaming flag
   const STOP_BTN_SEL =
     '#composer-submit-button[data-testid="stop-button"],' +
     '[data-testid="stop-button"],' +
@@ -71,7 +61,7 @@
   // ====== State ======
   let expanded = false;
   let visibleCount = BATCH;
-  let hiddenStore = [];            // detach store: [{ placeholder, node }]
+  let hiddenStore = [];
   let observer = null;
   let observerRoot = null;
   let isRevealing = false;
@@ -80,28 +70,57 @@
   let scrollContainer = null;
   let scrollAttachedTo = null;
 
-  // Early-exit metrics for apply()
+  // Metrics
   let lastMetrics = { total: -1, desiredVisible: -1, mode: MODE, expanded };
 
-  // Streaming state
+  // Streaming
   let isStreaming = false;
   let streamFlipTimer = null;
   let softJobScheduled = false;
 
-  // Track current URL (SPA navigation)
+  // URL tracking (fallback watcher still present)
   let lastURL = location.href;
 
-  // ====== Token estimator (≈ 1.3 × spaces) ======
-  const TOKEN_RATIO = 1.3;               // 1 word ≈ 1.3 tokens; tokens ≈ 1.3 × spaces
-  const TOKENS_PER_TICK = 20;            // nodes to compute per tick when missing cache
-  let tokenCache = new WeakMap();        // NOTE: let (so we can reset on URL change)
+  // Initial stabilization (used if full-nav is guarded/disabled)
+  let isInitializing = false;
+  const STABLE_CHECK_INTERVAL = 200;
+  const STABLE_REQUIRED_MS    = 600;
+  const INIT_TIMEOUT_MS       = 5000;
+
+  // Token estimator (≈ 1.3 × spaces)
+  const TOKEN_RATIO = 1.3;
+  const TOKENS_PER_TICK = 20;
+  let tokenCache = new WeakMap();
   const lastTokens = { visible: null, total: null };
   let wantTokensVisible = false, wantTokensTotal = false, tokenJobQueued = false;
 
   // ====== Utils ======
   const debounce = (fn, wait) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), wait); }; };
 
-  const hasStopButton = () => !!document.querySelector(STOP_BTN_SEL);
+  const isVisible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || +cs.opacity === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+
+  function pickActiveFeedRoot() {
+    // Pick the largest visible [role=feed]; ignores hidden stale feeds left by SPA routing.
+    const cands = Array.from(document.querySelectorAll('[role="feed"]'));
+    let best = null, bestArea = -1;
+    for (const el of cands) {
+      if (!isVisible(el)) continue;
+      const r = el.getBoundingClientRect();
+      const area = Math.max(1, r.width) * Math.max(1, r.height);
+      if (area > bestArea) { best = el; bestArea = area; }
+    }
+    if (best) return best;
+    return document.querySelector('main [role="feed"]')
+        || document.querySelector('main')
+        || document.body
+        || document.documentElement;
+  }
 
   function ensureStyle() {
     if (document.getElementById('cgpt-lazy-style')) return;
@@ -132,13 +151,14 @@
     document.body.appendChild(b);
   }
 
-  function getTurns() { return Array.from(document.querySelectorAll(TURN_SELECTOR)); }
-
-  function getAllTurnNodes() {
-    return hiddenStore.length ? hiddenStore.map(h => h.node).concat(getTurns()) : getTurns();
+  function queryInRoot(selector) {
+    const root = observerRoot || pickActiveFeedRoot() || document;
+    return Array.from(root.querySelectorAll(selector));
   }
 
-  function getTotalTurns() { return getTurns().length + hiddenStore.length; }
+  const getTurns = () => queryInRoot(TURN_SELECTOR);
+  const getAllTurnNodes = () => hiddenStore.length ? hiddenStore.map(h => h.node).concat(getTurns()) : getTurns();
+  const getTotalTurns = () => getTurns().length + hiddenStore.length;
 
   function formatTokens(n) {
     if (n == null) return '…';
@@ -148,7 +168,6 @@
   }
 
   function countSpaces(text) {
-    // Count space, tab, line breaks and NBSP
     let c = 0;
     for (let i = 0; i < text.length; i++) {
       const ch = text.charCodeAt(i);
@@ -157,15 +176,12 @@
     return c;
   }
 
-  function tokensForNode(node) {
-    let rec = tokenCache.get(node);
-    if (!rec || rec.dirty) {
-      const text = node.textContent || '';
-      const spaces = countSpaces(text);
-      rec = { tokens: Math.round(spaces * TOKEN_RATIO), dirty: false };
-      tokenCache.set(node, rec);
-    }
-    return rec.tokens;
+  function scheduleTokens(kind) {
+    if (kind === 'visible' || kind === 'both') wantTokensVisible = true;
+    if (kind === 'total'   || kind === 'both') wantTokensTotal   = true;
+    if (tokenJobQueued) return;
+    tokenJobQueued = true;
+    setTimeout(runTokenJob, 0);
   }
 
   function sumTokensForNodes(nodes, done) {
@@ -176,7 +192,6 @@
         const n = nodes[i];
         let rec = tokenCache.get(n);
         if (!rec || rec.dirty) {
-          // Compute missing entries in small chunks to avoid blocking UI
           const text = n.textContent || '';
           const spaces = countSpaces(text);
           rec = { tokens: Math.round(spaces * TOKEN_RATIO), dirty: false };
@@ -190,17 +205,9 @@
     })();
   }
 
-  function scheduleTokens(kind) {
-    if (kind === 'visible' || kind === 'both') wantTokensVisible = true;
-    if (kind === 'total'   || kind === 'both') wantTokensTotal   = true;
-    if (tokenJobQueued) return;
-    tokenJobQueued = true;
-    setTimeout(runTokenJob, 0);
-  }
-
   function runTokenJob() {
     tokenJobQueued = false;
-    if (STREAM_SAFE && isStreaming) return; // defer while streaming
+    if (STREAM_SAFE && isStreaming) return;
     const all = getAllTurnNodes();
     const desired = expanded ? all.length : Math.min(visibleCount, all.length);
     const visibleNodes = all.slice(all.length - desired);
@@ -230,7 +237,6 @@
     const total = (typeof totalCached === 'number') ? totalCached : getTotalTurns();
     const desired = expanded ? total : Math.min(visibleCount, total);
     const hidden = Math.max(0, total - desired);
-
     const badge = badgeText();
 
     b.textContent = expanded
@@ -239,7 +245,7 @@
   }
 
   function clearMarksAll() {
-    document.querySelectorAll('.lazy-turn-hidden, .lazy-turn-cv')
+    queryInRoot('.lazy-turn-hidden, .lazy-turn-cv')
       .forEach(el => el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv'));
   }
 
@@ -257,7 +263,7 @@
 
   function resolveScrollContainer() {
     const turns = getTurns();
-    const probe = turns.length ? turns[turns.length - 1] : document.body;
+    const probe = turns.length ? turns[turns.length - 1] : (observerRoot || document.body);
     const newContainer = findScrollableAncestor(probe);
     if (newContainer !== scrollContainer) {
       try { if (scrollAttachedTo) scrollAttachedTo.removeEventListener('scroll', onScroll); } catch {}
@@ -269,11 +275,11 @@
     }
   }
 
-  function viewportTop() { return scrollContainer ? scrollContainer.getBoundingClientRect().top : 0; }
-  function getScrollTop() { return scrollContainer ? scrollContainer.scrollTop : (window.scrollY || document.documentElement.scrollTop || 0); }
-  function getScrollHeight() { return scrollContainer ? scrollContainer.scrollHeight : (document.scrollingElement || document.documentElement || document.body).scrollHeight; }
-  function scrollByDelta(dy) { if (!dy) return; if (!scrollContainer) window.scrollBy({ top: dy, left: 0, behavior: 'auto' }); else scrollContainer.scrollTop += dy; }
-  function scrollToBottom() { const h = getScrollHeight(); if (!scrollContainer) window.scrollTo({ top: h, behavior: 'auto' }); else scrollContainer.scrollTop = h; }
+  const viewportTop = () => (scrollContainer ? scrollContainer.getBoundingClientRect().top : 0);
+  const getScrollTop = () => (scrollContainer ? scrollContainer.scrollTop : (window.scrollY || document.documentElement.scrollTop || 0));
+  const getScrollHeight = () => (scrollContainer ? scrollContainer.scrollHeight : (document.scrollingElement || document.documentElement || document.body).scrollHeight);
+  const scrollByDelta = (dy) => { if (!dy) return; if (!scrollContainer) window.scrollBy({ top: dy, left: 0, behavior: 'auto' }); else scrollContainer.scrollTop += dy; };
+  const scrollToBottom = () => { const h = getScrollHeight(); if (!scrollContainer) window.scrollTo({ top: h, behavior: 'auto' }); else scrollContainer.scrollTop = h; };
 
   function findAnchorElement() {
     const vt = viewportTop();
@@ -325,17 +331,19 @@
     return limit;
   }
 
-  // ====== Streaming: soft folding (chunked) ======
+  // ====== Streaming helpers ======
+  const hasStopButtonVisible = () =>
+    Array.from(document.querySelectorAll(STOP_BTN_SEL)).some(isVisible);
+
   function softFoldDuringStream() {
     if (!STREAM_SAFE || !isStreaming) return;
 
     const turns = getTurns();
     const total = turns.length + hiddenStore.length;
     const desired = expanded ? total : Math.min(visibleCount, total);
-    const cutoff  = Math.max(0, turns.length - desired); // fold the head
-    const cleanLo = Math.max(0, turns.length - desired); // clean visible tail
+    const cutoff  = Math.max(0, turns.length - desired);
+    const cleanLo = Math.max(0, turns.length - desired);
 
-    // Clean visible tail
     for (let i = cleanLo; i < turns.length; i++) {
       const el = turns[i];
       if (!el) continue;
@@ -344,7 +352,6 @@
       }
     }
 
-    // Fold head in chunks
     let idx = 0;
     (function step() {
       if (!isStreaming || !STREAM_SAFE) return;
@@ -366,8 +373,10 @@
     setTimeout(() => { softJobScheduled = false; softFoldDuringStream(); }, 100);
   }
 
-  // ====== Main logic (non-stream phase) ======
+  // ====== Main logic ======
   function apply({ preserveAnchor = false, force = false } = {}) {
+    if (isInitializing) { updateButton(); return; }
+
     resolveScrollContainer();
 
     const turnsNow = getTurns();
@@ -390,7 +399,7 @@
       });
       lastMetrics = { total, desiredVisible: desired, mode: MODE, expanded };
       updateButton(total);
-      scheduleTokens('total'); // recompute tokens for total
+      scheduleTokens('total');
       return;
     }
 
@@ -437,7 +446,7 @@
 
     lastMetrics = { total, desiredVisible: desired, mode: MODE, expanded };
     updateButton(total);
-    scheduleTokens('visible'); // recompute tokens for visible part
+    scheduleTokens('visible');
   }
 
   // ====== Upward infinite reveal ======
@@ -451,8 +460,8 @@
     visibleCount = desired;
 
     if (STREAM_SAFE && isStreaming) {
-      scheduleSoftFoldDuringStream(); // soft only — skip heavy apply()
-      scheduleTokens('visible');      // recalc tokens after streaming finishes
+      scheduleSoftFoldDuringStream();
+      scheduleTokens('visible');
     } else {
       apply({ preserveAnchor: true, force: true });
     }
@@ -468,7 +477,6 @@
   function toggle() {
     expanded = !expanded;
     if (expanded && (STREAM_SAFE && isStreaming)) {
-      // Expand visually even during stream: just remove marks
       clearMarksAll();
       updateButton(); scheduleTokens('total');
     } else {
@@ -480,32 +488,108 @@
     }
   }
 
-  // ====== URL change reset ======
+  // ====== Force full navigation on in-domain URL changes ======
+  function shouldForceNav(toURL) {
+    try {
+      const cur = new URL(location.href);
+      const next = new URL(toURL, location.href);
+      if (cur.origin !== next.origin) return false;     // external domain: let browser handle it
+      // Ignore pure hash changes
+      const sameExceptHash =
+        cur.origin === next.origin &&
+        cur.pathname === next.pathname &&
+        cur.search   === next.search   &&
+        cur.hash     !== next.hash;
+      if (sameExceptHash) return false;
+      return true;
+    } catch { return false; }
+  }
+
+  function guardAndAssign(href) {
+    try {
+      const now = Date.now();
+      const raw = sessionStorage.getItem(RELOAD_GUARD_KEY);
+      const info = raw ? JSON.parse(raw) : null;
+      if (!info || info.url !== href || (now - info.ts) > RELOAD_GUARD_MS) {
+        sessionStorage.setItem(RELOAD_GUARD_KEY, JSON.stringify({ url: href, ts: now }));
+        window.location.assign(href); // full navigation (not SPA)
+      }
+    } catch {
+      window.location.assign(href);
+    }
+  }
+
+  // Intercept clicks on any in-domain <a href="..."> and force full navigation,
+  // EXCEPT when the click originated from a <button> inside that <a>
+  // (folder toggle icon, "More" triple-dot, etc.).
+  document.addEventListener('click', (e) => {
+    if (!FORCE_FULL_NAV) return;
+    const isPrimary = (e.button === 0);
+    const modifiers = e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+    if (!isPrimary || modifiers || e.defaultPrevented) return;
+
+    const a = e.target && e.target.closest && e.target.closest('a[href]');
+    if (!a) return;
+
+    // Do not hijack clicks that are meant for local controls inside the row
+    // (folder open/close button, three-dots menu, etc.)
+    const innerButton = e.target.closest('button');
+    if (innerButton && a.contains(innerButton)) return;
+
+    if (a.target && a.target.toLowerCase() === '_blank') return;
+    if (a.hasAttribute('download')) return;
+
+    const href = a.getAttribute('href');
+    const url = new URL(href, location.href);
+    if (!shouldForceNav(url.href)) return;
+
+    e.preventDefault();
+    guardAndAssign(url.href);
+  }, true);
+
+  // If SPA code calls history.pushState / replaceState, force full navigation instead.
+  if (FORCE_FULL_NAV) {
+    const wrapHistory = (method) => {
+      const orig = history[method];
+      history[method] = function (state, title, url) {
+        const prev = location.href;
+        const ret  = orig.apply(this, arguments);
+        try {
+          if (url) {
+            const next = new URL(url, prev).href;
+            if (shouldForceNav(next)) guardAndAssign(next);
+          }
+        } catch { /* ignore */ }
+        return ret;
+      };
+    };
+    wrapHistory('pushState');
+    wrapHistory('replaceState');
+
+    window.addEventListener('popstate', () => {
+      if (shouldForceNav(location.href)) guardAndAssign(location.href);
+    });
+  }
+
+  // ====== Fallback soft reset (kept for safety if forcing is disabled/guarded) ======
   function resetForNewChat() {
-    // Drop any marks in current DOM (just in case)
     clearMarksAll();
 
-    // Reset core state
     expanded = false;
     visibleCount = BATCH;
     isRevealing = false;
 
-    // Detach/archive store — forget old nodes
     hiddenStore.length = 0;
 
-    // Scroll container will be resolved on next apply
     scrollContainer = null;
     scrollAttachedTo = null;
 
-    // Reset metrics so apply() definitely runs
     lastMetrics = { total: -1, desiredVisible: -1, mode: MODE, expanded };
 
-    // Streaming flags/timers
     isStreaming = false;
     if (streamFlipTimer) { clearTimeout(streamFlipTimer); streamFlipTimer = null; }
     softJobScheduled = false;
 
-    // Tokens: clear cache & last values
     tokenCache = new WeakMap();
     lastTokens.visible = null;
     lastTokens.total = null;
@@ -513,20 +597,44 @@
     wantTokensTotal = false;
     tokenJobQueued = false;
 
-    // Re-attach observer to the new feed root
-    attachObserver(pickFeedRoot());
+    observerRoot = pickActiveFeedRoot();
+    attachObserver(observerRoot);
 
-    // Apply fresh collapsed view and recalc visible tokens
-    apply({ preserveAnchor: false, force: true });
-    scheduleTokens('visible');
+    startInitialStabilization();
+  }
 
-    // Scroll to the bottom of the new chat
-    requestAnimationFrame(scrollToBottom);
+  function startInitialStabilization() {
+    isInitializing = true;
+    let lastLen = -1;
+    let stableMs = 0;
+    const t0 = Date.now();
+
+    (function tick() {
+      observerRoot = pickActiveFeedRoot();
+      const len = getTurns().length;
+
+      if (len > 0 && len === lastLen) {
+        stableMs += STABLE_CHECK_INTERVAL;
+      } else {
+        stableMs = 0;
+        lastLen = len;
+      }
+
+      const timeout = (Date.now() - t0) >= INIT_TIMEOUT_MS;
+      if (stableMs >= STABLE_REQUIRED_MS || timeout) {
+        isInitializing = false;
+        apply({ preserveAnchor: false, force: true });
+        scheduleTokens('visible');
+        requestAnimationFrame(scrollToBottom);
+      } else {
+        setTimeout(tick, STABLE_CHECK_INTERVAL);
+      }
+    })();
   }
 
   // ====== Observe & boot ======
   function recomputeStreamingFlag() {
-    const hard = hasStopButton();
+    const hard = hasStopButtonVisible();
     if (hard) {
       if (!isStreaming) { isStreaming = true; scheduleSoftFoldDuringStream(); }
       if (streamFlipTimer) { clearTimeout(streamFlipTimer); streamFlipTimer = null; }
@@ -536,7 +644,6 @@
       streamFlipTimer = setTimeout(() => {
         isStreaming = false;
         streamFlipTimer = null;
-        // After streaming ends — run full pass and token recompute
         apply({ preserveAnchor: true, force: true });
         scheduleTokens('both');
       }, STREAM_OFF_COOLDOWN);
@@ -547,11 +654,10 @@
     if (observer) observer.disconnect();
     observer = new MutationObserver(
       debounce(() => {
-        // Update streaming flag via Stop button presence
         recomputeStreamingFlag();
 
+        if (isInitializing) { updateButton(); return; }
         if (STREAM_SAFE && isStreaming) {
-          // During stream — no heavy work
           scheduleSoftFoldDuringStream();
           updateButton();
           return;
@@ -559,51 +665,44 @@
         apply({ preserveAnchor: false });
       }, OBS_DEBOUNCE_MS)
     );
+
     try {
-      observer.observe(root, { childList: true, subtree: true });
-      observerRoot = root;
+      if (!root) root = pickActiveFeedRoot();
+      observer.observe(root || document.documentElement, { childList: true, subtree: true });
+      observerRoot = root || observerRoot || document.body;
     } catch {
       observer.observe(document.documentElement, { childList: true, subtree: true });
-      observerRoot = document.documentElement;
+      observerRoot = observerRoot || pickActiveFeedRoot() || document.body;
     }
-  }
-
-  function pickFeedRoot() {
-    return document.querySelector('[role="feed"]') ||
-           document.querySelector('main [role="feed"]') ||
-           document.querySelector('main') ||
-           document.body ||
-           document.documentElement;
   }
 
   function boot() {
     ensureStyle();
     ensureButton();
 
-    attachObserver(pickFeedRoot());
+    observerRoot = pickActiveFeedRoot();
+    attachObserver(observerRoot);
 
-    // Initial fold
     apply({ preserveAnchor: false, force: true });
     scheduleTokens('visible');
 
-    // Periodic Stop-button polling (cheap & robust)
+    // Streaming polling
     setInterval(recomputeStreamingFlag, 300);
 
-    // SPA/pending init poll + URL change detection
+    // Fallback SPA watcher (should rarely be needed now)
     let tries = 80;
     const poll = setInterval(() => {
-      // Detect URL change (SPA navigation) and reset all state
       if (location.href !== lastURL) {
         lastURL = location.href;
-        resetForNewChat();
-        // fresh boot for the new chat, skip the rest of this tick
+        if (!FORCE_FULL_NAV) resetForNewChat();
         return;
       }
 
-      const root = pickFeedRoot();
-      if (root && root !== observerRoot) attachObserver(root);
+      const root = pickActiveFeedRoot();
+      if (root && root !== observerRoot) { observerRoot = root; attachObserver(root); }
       recomputeStreamingFlag();
-      if (!isStreaming) apply({ preserveAnchor: false });
+
+      if (!isInitializing && !isStreaming) apply({ preserveAnchor: false });
       if (getTurns().length > 0 || --tries <= 0) clearInterval(poll);
     }, 250);
   }
