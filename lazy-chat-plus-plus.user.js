@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Lazy Chat++ (stream-safe + tokens badge)
 // @namespace    chatgpt-lazy
-// @version      1.0.3
+// @version      1.0.4
 // @description  Keeps only the last N chat turns visible with smooth upward reveal. Stream-safe virtualization (no heavy work while generating). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
@@ -25,25 +25,24 @@
 (function () {
   'use strict';
 
-  // ====== Settings ======
+  // =========================
+  // Settings
+  // =========================
   const MODE = 'detach';            // 'hide' | 'detach' | 'cv'
-  const BATCH = 8;
+  const BATCH = 8;                  // upward auto-reveal batch size
   const OBS_DEBOUNCE_MS = 250;
-  const TOP_REVEAL_THRESHOLD = 120;
+  const TOP_REVEAL_THRESHOLD = 120; // px from top to trigger reveal
   const BTN_ID = 'cgpt-lazy-btn';
 
-  // Stream-safety & chunking
+  // Stream-safety
   const STREAM_SAFE = true;
   const STREAM_OFF_COOLDOWN = 500;
+
+  // Anti-freeze chunking
   const MAX_DETACH_PER_TICK = 50;
   const STREAM_SOFT_CHUNK   = 40;
 
-  // Full navigation policy on any in-domain URL change
-  const FORCE_FULL_NAV = true;
-  const RELOAD_GUARD_KEY = 'cgpt-lazy-fullnav';
-  const RELOAD_GUARD_MS  = 5000; // guard against loops for the same URL
-
-  // Turn containers
+  // Turn nodes
   const TURN_SELECTOR = [
     '[data-testid^="conversation-turn"]',
     'article[data-turn-id]',
@@ -52,16 +51,18 @@
     'li[data-testid^="conversation-turn"]'
   ].join(',');
 
-  // Streaming flag
+  // Streaming flag — “Stop streaming” button
   const STOP_BTN_SEL =
     '#composer-submit-button[data-testid="stop-button"],' +
     '[data-testid="stop-button"],' +
     'button[aria-label*="stop streaming" i]';
 
-  // ====== State ======
+  // =========================
+  // State
+  // =========================
   let expanded = false;
   let visibleCount = BATCH;
-  let hiddenStore = [];
+  let hiddenStore = [];            // detach store: [{ placeholder, node }]
   let observer = null;
   let observerRoot = null;
   let isRevealing = false;
@@ -70,57 +71,28 @@
   let scrollContainer = null;
   let scrollAttachedTo = null;
 
-  // Metrics
+  // Metrics cache for apply()
   let lastMetrics = { total: -1, desiredVisible: -1, mode: MODE, expanded };
 
-  // Streaming
+  // Streaming state
   let isStreaming = false;
   let streamFlipTimer = null;
   let softJobScheduled = false;
 
-  // URL tracking (fallback watcher still present)
-  let lastURL = location.href;
-
-  // Initial stabilization (used if full-nav is guarded/disabled)
-  let isInitializing = false;
-  const STABLE_CHECK_INTERVAL = 200;
-  const STABLE_REQUIRED_MS    = 600;
-  const INIT_TIMEOUT_MS       = 5000;
-
-  // Token estimator (≈ 1.3 × spaces)
+  // =========================
+  // Token estimator (≈1.3×spaces)
+  // =========================
   const TOKEN_RATIO = 1.3;
   const TOKENS_PER_TICK = 20;
-  let tokenCache = new WeakMap();
+  const tokenCache = new WeakMap(); // WeakMap<Node, {tokens:number, dirty?:boolean}>
   const lastTokens = { visible: null, total: null };
   let wantTokensVisible = false, wantTokensTotal = false, tokenJobQueued = false;
 
-  // ====== Utils ======
+  // =========================
+  // Utils
+  // =========================
   const debounce = (fn, wait) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), wait); }; };
-
-  const isVisible = (el) => {
-    if (!el || !el.isConnected) return false;
-    const cs = getComputedStyle(el);
-    if (cs.display === 'none' || cs.visibility === 'hidden' || +cs.opacity === 0) return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
-  };
-
-  function pickActiveFeedRoot() {
-    // Pick the largest visible [role=feed]; ignores hidden stale feeds left by SPA routing.
-    const cands = Array.from(document.querySelectorAll('[role="feed"]'));
-    let best = null, bestArea = -1;
-    for (const el of cands) {
-      if (!isVisible(el)) continue;
-      const r = el.getBoundingClientRect();
-      const area = Math.max(1, r.width) * Math.max(1, r.height);
-      if (area > bestArea) { best = el; bestArea = area; }
-    }
-    if (best) return best;
-    return document.querySelector('main [role="feed"]')
-        || document.querySelector('main')
-        || document.body
-        || document.documentElement;
-  }
+  const hasStopButton = () => !!document.querySelector(STOP_BTN_SEL);
 
   function ensureStyle() {
     if (document.getElementById('cgpt-lazy-style')) return;
@@ -151,22 +123,32 @@
     document.body.appendChild(b);
   }
 
-  function queryInRoot(selector) {
-    const root = observerRoot || pickActiveFeedRoot() || document;
-    return Array.from(root.querySelectorAll(selector));
+  function updateButton(totalCached) {
+    ensureButton();
+    const b = document.getElementById(BTN_ID);
+    if (!b) return;
+
+    const total = (typeof totalCached === 'number') ? totalCached : getTotalTurns();
+    const desired = expanded ? total : Math.min(visibleCount, total);
+    const hidden = Math.max(0, total - desired);
+
+    const badge = badgeText();
+    b.textContent = expanded
+      ? `Show only last ${BATCH} ${badge}`
+      : (hidden > 0 ? `Show ${hidden} older ${badge}` : `Hide older (none) ${badge}`);
   }
 
-  const getTurns = () => queryInRoot(TURN_SELECTOR);
-  const getAllTurnNodes = () => hiddenStore.length ? hiddenStore.map(h => h.node).concat(getTurns()) : getTurns();
-  const getTotalTurns = () => getTurns().length + hiddenStore.length;
+  function getTurns() { return Array.from(document.querySelectorAll(TURN_SELECTOR)); }
+  function getAllTurnNodes() { return hiddenStore.length ? hiddenStore.map(h => h.node).concat(getTurns()) : getTurns(); }
+  function getTotalTurns() { return getTurns().length + hiddenStore.length; }
 
+  // ----- tokens -----
   function formatTokens(n) {
     if (n == null) return '…';
     if (n >= 1e6)  return (n / 1e6).toFixed(n % 1e6 >= 1e5 ? 1 : 0) + 'M';
     if (n >= 1e3)  return (n / 1e3).toFixed(n % 1e3 >= 100 ? 1 : 0) + 'k';
     return String(n);
   }
-
   function countSpaces(text) {
     let c = 0;
     for (let i = 0; i < text.length; i++) {
@@ -175,15 +157,16 @@
     }
     return c;
   }
-
-  function scheduleTokens(kind) {
-    if (kind === 'visible' || kind === 'both') wantTokensVisible = true;
-    if (kind === 'total'   || kind === 'both') wantTokensTotal   = true;
-    if (tokenJobQueued) return;
-    tokenJobQueued = true;
-    setTimeout(runTokenJob, 0);
+  function tokensForNode(node) {
+    let rec = tokenCache.get(node);
+    if (!rec || rec.dirty) {
+      const text = node.textContent || '';
+      const spaces = countSpaces(text);
+      rec = { tokens: Math.round(spaces * TOKEN_RATIO), dirty: false };
+      tokenCache.set(node, rec);
+    }
+    return rec.tokens;
   }
-
   function sumTokensForNodes(nodes, done) {
     let sum = 0, i = 0;
     (function step() {
@@ -204,7 +187,13 @@
       done(sum);
     })();
   }
-
+  function scheduleTokens(kind) {
+    if (kind === 'visible' || kind === 'both') wantTokensVisible = true;
+    if (kind === 'total'   || kind === 'both') wantTokensTotal   = true;
+    if (tokenJobQueued) return;
+    tokenJobQueued = true;
+    setTimeout(runTokenJob, 0);
+  }
   function runTokenJob() {
     tokenJobQueued = false;
     if (STREAM_SAFE && isStreaming) return;
@@ -215,7 +204,6 @@
     const tasks = [];
     if (wantTokensVisible) tasks.push(cb => sumTokensForNodes(visibleNodes, v => { lastTokens.visible = v; cb(); }));
     if (wantTokensTotal)   tasks.push(cb => sumTokensForNodes(all,          v => { lastTokens.total   = v; cb(); }));
-
     wantTokensVisible = wantTokensTotal = false;
 
     (function run(i) {
@@ -223,33 +211,17 @@
       tasks[i](() => setTimeout(() => run(i + 1), 0));
     })(0);
   }
-
   function badgeText() {
     const need = expanded ? 'total' : 'visible';
     const val = lastTokens[need];
     return `[T:// ${formatTokens(val)}]`;
   }
 
-  function updateButton(totalCached) {
-    ensureButton();
-    const b = document.getElementById(BTN_ID);
-    if (!b) return;
-    const total = (typeof totalCached === 'number') ? totalCached : getTotalTurns();
-    const desired = expanded ? total : Math.min(visibleCount, total);
-    const hidden = Math.max(0, total - desired);
-    const badge = badgeText();
-
-    b.textContent = expanded
-      ? `Show only last ${BATCH} ${badge}`
-      : (hidden > 0 ? `Show ${hidden} older ${badge}` : `Hide older (none) ${badge}`);
-  }
-
+  // ----- scroll/anchor -----
   function clearMarksAll() {
-    queryInRoot('.lazy-turn-hidden, .lazy-turn-cv')
+    document.querySelectorAll('.lazy-turn-hidden, .lazy-turn-cv')
       .forEach(el => el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv'));
   }
-
-  // ====== Scroll / anchor ======
   function findScrollableAncestor(node) {
     let el = node && node.parentElement;
     while (el && el !== document.documentElement) {
@@ -260,10 +232,9 @@
     }
     return null;
   }
-
   function resolveScrollContainer() {
     const turns = getTurns();
-    const probe = turns.length ? turns[turns.length - 1] : (observerRoot || document.body);
+    const probe = turns.length ? turns[turns.length - 1] : document.body;
     const newContainer = findScrollableAncestor(probe);
     if (newContainer !== scrollContainer) {
       try { if (scrollAttachedTo) scrollAttachedTo.removeEventListener('scroll', onScroll); } catch {}
@@ -274,13 +245,11 @@
       scrollAttachedTo = scrollContainer || null;
     }
   }
-
-  const viewportTop = () => (scrollContainer ? scrollContainer.getBoundingClientRect().top : 0);
-  const getScrollTop = () => (scrollContainer ? scrollContainer.scrollTop : (window.scrollY || document.documentElement.scrollTop || 0));
-  const getScrollHeight = () => (scrollContainer ? scrollContainer.scrollHeight : (document.scrollingElement || document.documentElement || document.body).scrollHeight);
-  const scrollByDelta = (dy) => { if (!dy) return; if (!scrollContainer) window.scrollBy({ top: dy, left: 0, behavior: 'auto' }); else scrollContainer.scrollTop += dy; };
-  const scrollToBottom = () => { const h = getScrollHeight(); if (!scrollContainer) window.scrollTo({ top: h, behavior: 'auto' }); else scrollContainer.scrollTop = h; };
-
+  function viewportTop() { return scrollContainer ? scrollContainer.getBoundingClientRect().top : 0; }
+  function getScrollTop() { return scrollContainer ? scrollContainer.scrollTop : (window.scrollY || document.documentElement.scrollTop || 0); }
+  function getScrollHeight() { return scrollContainer ? scrollContainer.scrollHeight : (document.scrollingElement || document.documentElement || document.body).scrollHeight; }
+  function scrollByDelta(dy) { if (!dy) return; if (!scrollContainer) window.scrollBy({ top: dy, left: 0, behavior: 'auto' }); else scrollContainer.scrollTop += dy; }
+  function scrollToBottom() { const h = getScrollHeight(); if (!scrollContainer) window.scrollTo({ top: h, behavior: 'auto' }); else scrollContainer.scrollTop = h; }
   function findAnchorElement() {
     const vt = viewportTop();
     const turns = getTurns();
@@ -290,7 +259,6 @@
     }
     return turns[0] || null;
   }
-
   function withAnchor(preserve, action) {
     if (!preserve) { action(); return; }
     resolveScrollContainer();
@@ -305,7 +273,7 @@
     }
   }
 
-  // ====== Detach helpers ======
+  // ----- detach helpers -----
   function restoreSome(count) {
     if (!count) return;
     const start = Math.max(0, hiddenStore.length - count);
@@ -315,7 +283,6 @@
       if (placeholder && placeholder.isConnected) placeholder.replaceWith(node);
     });
   }
-
   function detachFirstN(turns, n) {
     if (n <= 0) return 0;
     const limit = Math.min(n, MAX_DETACH_PER_TICK);
@@ -331,27 +298,23 @@
     return limit;
   }
 
-  // ====== Streaming helpers ======
-  const hasStopButtonVisible = () =>
-    Array.from(document.querySelectorAll(STOP_BTN_SEL)).some(isVisible);
-
+  // ----- streaming soft fold -----
   function softFoldDuringStream() {
     if (!STREAM_SAFE || !isStreaming) return;
-
     const turns = getTurns();
     const total = turns.length + hiddenStore.length;
     const desired = expanded ? total : Math.min(visibleCount, total);
     const cutoff  = Math.max(0, turns.length - desired);
-    const cleanLo = Math.max(0, turns.length - desired);
 
-    for (let i = cleanLo; i < turns.length; i++) {
+    // clean visible tail
+    for (let i = turns.length - desired; i < turns.length; i++) {
       const el = turns[i];
       if (!el) continue;
       if (el.classList.contains('lazy-turn-hidden') || el.classList.contains('lazy-turn-cv')) {
         el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv');
       }
     }
-
+    // fold head chunked
     let idx = 0;
     (function step() {
       if (!isStreaming || !STREAM_SAFE) return;
@@ -359,24 +322,21 @@
       for (let i = idx; i < end; i++) {
         const el = turns[i];
         if (!el) continue;
-        if (el.classList.contains('lazy-turn-hidden')) el.classList.remove('lazy-turn-hidden');
+        el.classList.remove('lazy-turn-hidden');
         if (!el.classList.contains('lazy-turn-cv')) el.classList.add('lazy-turn-cv');
       }
       idx = end;
       if (idx < cutoff) setTimeout(step, 0);
     })();
   }
-
   function scheduleSoftFoldDuringStream() {
     if (!STREAM_SAFE || !isStreaming || softJobScheduled) return;
     softJobScheduled = true;
     setTimeout(() => { softJobScheduled = false; softFoldDuringStream(); }, 100);
   }
 
-  // ====== Main logic ======
+  // ----- main apply (non-stream) -----
   function apply({ preserveAnchor = false, force = false } = {}) {
-    if (isInitializing) { updateButton(); return; }
-
     resolveScrollContainer();
 
     const turnsNow = getTurns();
@@ -428,18 +388,13 @@
         for (let i = turns.length - desired; i < turns.length; i++) {
           const el = turns[i];
           if (!el) continue;
-          if (el.classList.contains('lazy-turn-hidden') || el.classList.contains('lazy-turn-cv')) {
-            el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv');
-          }
+          el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv');
         }
         for (let i = 0; i < cutoff; i++) {
           const el = turns[i];
           if (!el) continue;
-          if (MODE === 'hide') {
-            if (!el.classList.contains('lazy-turn-hidden')) el.classList.add('lazy-turn-hidden');
-          } else if (MODE === 'cv') {
-            if (!el.classList.contains('lazy-turn-cv')) el.classList.add('lazy-turn-cv');
-          }
+          if (MODE === 'hide') el.classList.add('lazy-turn-hidden');
+          else if (MODE === 'cv') el.classList.add('lazy-turn-cv');
         }
       });
     }
@@ -449,7 +404,7 @@
     scheduleTokens('visible');
   }
 
-  // ====== Upward infinite reveal ======
+  // ----- infinite reveal up -----
   function revealMoreUp() {
     if (expanded) return;
     const total = getTotalTurns();
@@ -467,13 +422,12 @@
     }
     requestAnimationFrame(() => { isRevealing = false; });
   }
-
   function onScroll() {
     if (expanded) return;
     if (getScrollTop() <= TOP_REVEAL_THRESHOLD) revealMoreUp();
   }
 
-  // ====== Toggle ======
+  // ----- toggle -----
   function toggle() {
     expanded = !expanded;
     if (expanded && (STREAM_SAFE && isStreaming)) {
@@ -488,153 +442,11 @@
     }
   }
 
-  // ====== Force full navigation on in-domain URL changes ======
-  function shouldForceNav(toURL) {
-    try {
-      const cur = new URL(location.href);
-      const next = new URL(toURL, location.href);
-      if (cur.origin !== next.origin) return false;     // external domain: let browser handle it
-      // Ignore pure hash changes
-      const sameExceptHash =
-        cur.origin === next.origin &&
-        cur.pathname === next.pathname &&
-        cur.search   === next.search   &&
-        cur.hash     !== next.hash;
-      if (sameExceptHash) return false;
-      return true;
-    } catch { return false; }
-  }
-
-  function guardAndAssign(href) {
-    try {
-      const now = Date.now();
-      const raw = sessionStorage.getItem(RELOAD_GUARD_KEY);
-      const info = raw ? JSON.parse(raw) : null;
-      if (!info || info.url !== href || (now - info.ts) > RELOAD_GUARD_MS) {
-        sessionStorage.setItem(RELOAD_GUARD_KEY, JSON.stringify({ url: href, ts: now }));
-        window.location.assign(href); // full navigation (not SPA)
-      }
-    } catch {
-      window.location.assign(href);
-    }
-  }
-
-  // Intercept clicks on any in-domain <a href="..."> and force full navigation,
-  // EXCEPT when the click originated from a <button> inside that <a>
-  // (folder toggle icon, "More" triple-dot, etc.).
-  document.addEventListener('click', (e) => {
-    if (!FORCE_FULL_NAV) return;
-    const isPrimary = (e.button === 0);
-    const modifiers = e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
-    if (!isPrimary || modifiers || e.defaultPrevented) return;
-
-    const a = e.target && e.target.closest && e.target.closest('a[href]');
-    if (!a) return;
-
-    // Do not hijack clicks that are meant for local controls inside the row
-    // (folder open/close button, three-dots menu, etc.)
-    const innerButton = e.target.closest('button');
-    if (innerButton && a.contains(innerButton)) return;
-
-    if (a.target && a.target.toLowerCase() === '_blank') return;
-    if (a.hasAttribute('download')) return;
-
-    const href = a.getAttribute('href');
-    const url = new URL(href, location.href);
-    if (!shouldForceNav(url.href)) return;
-
-    e.preventDefault();
-    guardAndAssign(url.href);
-  }, true);
-
-  // If SPA code calls history.pushState / replaceState, force full navigation instead.
-  if (FORCE_FULL_NAV) {
-    const wrapHistory = (method) => {
-      const orig = history[method];
-      history[method] = function (state, title, url) {
-        const prev = location.href;
-        const ret  = orig.apply(this, arguments);
-        try {
-          if (url) {
-            const next = new URL(url, prev).href;
-            if (shouldForceNav(next)) guardAndAssign(next);
-          }
-        } catch { /* ignore */ }
-        return ret;
-      };
-    };
-    wrapHistory('pushState');
-    wrapHistory('replaceState');
-
-    window.addEventListener('popstate', () => {
-      if (shouldForceNav(location.href)) guardAndAssign(location.href);
-    });
-  }
-
-  // ====== Fallback soft reset (kept for safety if forcing is disabled/guarded) ======
-  function resetForNewChat() {
-    clearMarksAll();
-
-    expanded = false;
-    visibleCount = BATCH;
-    isRevealing = false;
-
-    hiddenStore.length = 0;
-
-    scrollContainer = null;
-    scrollAttachedTo = null;
-
-    lastMetrics = { total: -1, desiredVisible: -1, mode: MODE, expanded };
-
-    isStreaming = false;
-    if (streamFlipTimer) { clearTimeout(streamFlipTimer); streamFlipTimer = null; }
-    softJobScheduled = false;
-
-    tokenCache = new WeakMap();
-    lastTokens.visible = null;
-    lastTokens.total = null;
-    wantTokensVisible = false;
-    wantTokensTotal = false;
-    tokenJobQueued = false;
-
-    observerRoot = pickActiveFeedRoot();
-    attachObserver(observerRoot);
-
-    startInitialStabilization();
-  }
-
-  function startInitialStabilization() {
-    isInitializing = true;
-    let lastLen = -1;
-    let stableMs = 0;
-    const t0 = Date.now();
-
-    (function tick() {
-      observerRoot = pickActiveFeedRoot();
-      const len = getTurns().length;
-
-      if (len > 0 && len === lastLen) {
-        stableMs += STABLE_CHECK_INTERVAL;
-      } else {
-        stableMs = 0;
-        lastLen = len;
-      }
-
-      const timeout = (Date.now() - t0) >= INIT_TIMEOUT_MS;
-      if (stableMs >= STABLE_REQUIRED_MS || timeout) {
-        isInitializing = false;
-        apply({ preserveAnchor: false, force: true });
-        scheduleTokens('visible');
-        requestAnimationFrame(scrollToBottom);
-      } else {
-        setTimeout(tick, STABLE_CHECK_INTERVAL);
-      }
-    })();
-  }
-
-  // ====== Observe & boot ======
+  // =========================
+  // Streaming detection & observer
+  // =========================
   function recomputeStreamingFlag() {
-    const hard = hasStopButtonVisible();
+    const hard = hasStopButton();
     if (hard) {
       if (!isStreaming) { isStreaming = true; scheduleSoftFoldDuringStream(); }
       if (streamFlipTimer) { clearTimeout(streamFlipTimer); streamFlipTimer = null; }
@@ -649,14 +461,11 @@
       }, STREAM_OFF_COOLDOWN);
     }
   }
-
   function attachObserver(root) {
     if (observer) observer.disconnect();
     observer = new MutationObserver(
       debounce(() => {
         recomputeStreamingFlag();
-
-        if (isInitializing) { updateButton(); return; }
         if (STREAM_SAFE && isStreaming) {
           scheduleSoftFoldDuringStream();
           updateButton();
@@ -665,44 +474,96 @@
         apply({ preserveAnchor: false });
       }, OBS_DEBOUNCE_MS)
     );
-
     try {
-      if (!root) root = pickActiveFeedRoot();
-      observer.observe(root || document.documentElement, { childList: true, subtree: true });
-      observerRoot = root || observerRoot || document.body;
+      observer.observe(root, { childList: true, subtree: true });
+      observerRoot = root;
     } catch {
       observer.observe(document.documentElement, { childList: true, subtree: true });
-      observerRoot = observerRoot || pickActiveFeedRoot() || document.body;
+      observerRoot = document.documentElement;
     }
   }
+  function pickFeedRoot() {
+    return document.querySelector('[role="feed"]') ||
+           document.querySelector('main [role="feed"]') ||
+           document.querySelector('main') ||
+           document.body ||
+           document.documentElement;
+  }
 
+  // =========================
+  // FULL reload only for sidebar links (fix model picker)
+  // =========================
+  const SIDEBAR_SCOPE_SEL = 'nav[aria-label="Chat history"], #history, [class*="sidebar-width"]';
+
+  function isInsideSidebar(node) {
+    return !!(node && node.closest(SIDEBAR_SCOPE_SEL));
+  }
+
+  function isInternalHref(href) {
+    if (!href) return false;
+    if (/^(mailto:|javascript:|data:)/i.test(href)) return false;
+    if (href.startsWith('#')) return false;
+    if (href.startsWith('/')) return true;
+    try { return new URL(href, location.origin).origin === location.origin; }
+    catch { return false; }
+  }
+
+  // Do NOT hijack clicks on buttons inside the menu row (folder toggle, triple-dot, etc.)
+  function clickIsOnMenuRowButton(target) {
+    return !!target.closest('a .icon button, a [data-trailing-button], .__menu-item-trailing-btn, button');
+  }
+
+  // Single source of truth: force navigation only if click happened in the sidebar scope.
+  document.addEventListener('click', (ev) => {
+    if (ev.defaultPrevented) return;
+    if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+
+    const t = ev.target;
+    const link = t && t.closest && t.closest('a[href]');
+    if (!link) return;
+
+    // Restrict to left sidebar only.
+    if (!isInsideSidebar(t)) return;
+
+    // Let folder toggle icon / trailing buttons work normally.
+    if (clickIsOnMenuRowButton(t)) return;
+
+    const href = link.getAttribute('href');
+    if (!isInternalHref(href)) return;
+    if (link.target === '_blank') return;
+
+    // Force full-page reload to avoid SPA leftovers.
+    try { sessionStorage.setItem('lcpp_pending_nav', '1'); } catch {}
+    ev.preventDefault();
+    location.assign(href);
+  }, true);
+
+  // Cleanup pending flag on load (best-effort).
+  try { sessionStorage.removeItem('lcpp_pending_nav'); } catch {}
+
+  // =========================
+  // Boot
+  // =========================
   function boot() {
     ensureStyle();
     ensureButton();
 
-    observerRoot = pickActiveFeedRoot();
-    attachObserver(observerRoot);
+    attachObserver(pickFeedRoot());
 
+    // initial fold
     apply({ preserveAnchor: false, force: true });
     scheduleTokens('visible');
 
-    // Streaming polling
+    // periodic streaming poll
     setInterval(recomputeStreamingFlag, 300);
 
-    // Fallback SPA watcher (should rarely be needed now)
+    // SPA init poll (kept small)
     let tries = 80;
     const poll = setInterval(() => {
-      if (location.href !== lastURL) {
-        lastURL = location.href;
-        if (!FORCE_FULL_NAV) resetForNewChat();
-        return;
-      }
-
-      const root = pickActiveFeedRoot();
-      if (root && root !== observerRoot) { observerRoot = root; attachObserver(root); }
+      const root = pickFeedRoot();
+      if (root && root !== observerRoot) attachObserver(root);
       recomputeStreamingFlag();
-
-      if (!isInitializing && !isStreaming) apply({ preserveAnchor: false });
+      if (!isStreaming) apply({ preserveAnchor: false });
       if (getTurns().length > 0 || --tries <= 0) clearInterval(poll);
     }, 250);
   }
