@@ -20,7 +20,7 @@ Long ChatGPT threads (60k–100k tokens) can make Chrome unusable — typing lag
 **Different from common extensions:**
 - Doesn’t break streaming — uses `content-visibility` or detaches only when safe.
 - Smooth **infinite scroll up** (loads 8 turns at a time).
-- Stream-safe: pauses heavy work while the model is typing.
+- Stream-safe: pauses work while the model is typing.
 - Shows a **token estimate** to understand the weight of visible vs full chat.
 
 ---
@@ -44,7 +44,7 @@ You’ll see a small button at bottom-right. It toggles between “show all” a
   - **hide** — `display: none` on older turns (lightweight).
   - **cv** — `content-visibility: auto` (browser keeps layout cheap).
   - **detach** — actually detaches the oldest DOM nodes (most memory-friendly), chunked to avoid blocking.
-- When the model is **streaming**, heavy work is **paused**: only a soft, chunked `content-visibility` pass runs so typing stays smooth.
+- When the model is **streaming**, heavy work is **paused**, so typing stays smooth.
 - When streaming **finishes**, the script performs chunked “archival” (detach/hide) to reach the target of “last N visible”.
 
 **Button shows `[T:// …]`** — a live token estimate:
