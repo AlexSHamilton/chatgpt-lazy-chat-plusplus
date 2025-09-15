@@ -4,6 +4,15 @@ All notable changes to **ChatGPT Lazy Chat++** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2025-09-15
+### Changed
+- **HARD PAUSE during streaming:** while the Stop button is visible, the script does **no DOM work at all** (no folding, no reveals, no token updates). Only a lightweight poll of the Stop-button state every **500 ms**.
+- After the stream ends, perform one **full recompute** with a **500 ms** cooldown (fold/restore, token totals, button badge, scroll anchor).
+
+### Fixed
+- Removes remaining freezes on **branched chats** (edited-turn alternatives) during generation by avoiding any mid-stream DOM mutations.
+- Blocks accidental **toggle/reveal** actions during streaming.
+
 ## [1.0.4] - 2025-09-14
 
 ### Fixed
