@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Lazy Chat++ (stream-safe + tokens badge)
 // @namespace    chatgpt-lazy
-// @version      1.0.5
+// @version      1.0.6
 // @description  Keeps only the last N chat turns visible with smooth upward reveal. HARD PAUSE during streaming (no DOM work at all). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
