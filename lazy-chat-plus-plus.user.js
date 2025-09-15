@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Lazy Chat++ (stream-safe + tokens badge)
 // @namespace    chatgpt-lazy
-// @version      1.0.4
-// @description  Keeps only the last N chat turns visible with smooth upward reveal. Stream-safe virtualization (no heavy work while generating). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
+// @version      1.0.5
+// @description  Keeps only the last N chat turns visible with smooth upward reveal. Stream-safe virtualization: HARD PAUSE during generation (no DOM work). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
 // @supportURL   https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus/issues
@@ -20,29 +20,40 @@
 /*!
  * ChatGPT Lazy Chat++ — Userscript
  * Copyright (C) 2025 Alex S Hamilton
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 (function () {
   'use strict';
 
-  // =========================
-  // Settings
-  // =========================
-  const MODE = 'detach';            // 'hide' | 'detach' | 'cv'
+  // ====== Settings ======
+  const MODE = 'detach';            // 'hide' | 'detach' | 'cv'  (mode label is replaced by T:// badge)
   const BATCH = 8;                  // upward auto-reveal batch size
   const OBS_DEBOUNCE_MS = 250;
   const TOP_REVEAL_THRESHOLD = 120; // px from top to trigger reveal
   const BTN_ID = 'cgpt-lazy-btn';
 
-  // Stream-safety
-  const STREAM_SAFE = true;
-  const STREAM_OFF_COOLDOWN = 500;
+  // Streaming: HARD PAUSE variant (do absolutely nothing while streaming)
+  const STREAM_HARD_PAUSE = true;   // hard stop all DOM work during streaming
+  const STREAM_POLL_MS = 500;       // poll only the Stop button state
+  const STREAM_OFF_COOLDOWN = 500;  // run a full pass shortly after Stop disappears
 
-  // Anti-freeze chunking
-  const MAX_DETACH_PER_TICK = 50;
-  const STREAM_SOFT_CHUNK   = 40;
+  // Anti-freeze chunking (used after streaming ends)
+  const MAX_DETACH_PER_TICK = 50;   // how many nodes to detach per tick after stream
 
-  // Turn nodes
+  // Selectors
   const TURN_SELECTOR = [
     '[data-testid^="conversation-turn"]',
     'article[data-turn-id]',
@@ -51,15 +62,13 @@
     'li[data-testid^="conversation-turn"]'
   ].join(',');
 
-  // Streaming flag — “Stop streaming” button
+  // "Stop streaming" button — streaming flag
   const STOP_BTN_SEL =
     '#composer-submit-button[data-testid="stop-button"],' +
     '[data-testid="stop-button"],' +
     'button[aria-label*="stop streaming" i]';
 
-  // =========================
-  // State
-  // =========================
+  // ====== State ======
   let expanded = false;
   let visibleCount = BATCH;
   let hiddenStore = [];            // detach store: [{ placeholder, node }]
@@ -71,26 +80,21 @@
   let scrollContainer = null;
   let scrollAttachedTo = null;
 
-  // Metrics cache for apply()
+  // Early-exit metrics for apply()
   let lastMetrics = { total: -1, desiredVisible: -1, mode: MODE, expanded };
 
   // Streaming state
   let isStreaming = false;
   let streamFlipTimer = null;
-  let softJobScheduled = false;
 
-  // =========================
-  // Token estimator (≈1.3×spaces)
-  // =========================
-  const TOKEN_RATIO = 1.3;
-  const TOKENS_PER_TICK = 20;
-  const tokenCache = new WeakMap(); // WeakMap<Node, {tokens:number, dirty?:boolean}>
+  // ====== Token estimator (≈ 1.3 × spaces) ======
+  const TOKEN_RATIO = 1.3;               // tokens ≈ 1.3 × spaces
+  const TOKENS_PER_TICK = 20;            // nodes to compute per tick when missing cache
+  const tokenCache = new WeakMap();      // WeakMap<Node, {tokens:number, dirty?:boolean}>
   const lastTokens = { visible: null, total: null };
   let wantTokensVisible = false, wantTokensTotal = false, tokenJobQueued = false;
 
-  // =========================
-  // Utils
-  // =========================
+  // ====== Utils ======
   const debounce = (fn, wait) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), wait); }; };
   const hasStopButton = () => !!document.querySelector(STOP_BTN_SEL);
 
@@ -123,33 +127,23 @@
     document.body.appendChild(b);
   }
 
-  function updateButton(totalCached) {
-    ensureButton();
-    const b = document.getElementById(BTN_ID);
-    if (!b) return;
+  function getTurns() { return Array.from(document.querySelectorAll(TURN_SELECTOR)); }
 
-    const total = (typeof totalCached === 'number') ? totalCached : getTotalTurns();
-    const desired = expanded ? total : Math.min(visibleCount, total);
-    const hidden = Math.max(0, total - desired);
-
-    const badge = badgeText();
-    b.textContent = expanded
-      ? `Show only last ${BATCH} ${badge}`
-      : (hidden > 0 ? `Show ${hidden} older ${badge}` : `Hide older (none) ${badge}`);
+  function getAllTurnNodes() {
+    return hiddenStore.length ? hiddenStore.map(h => h.node).concat(getTurns()) : getTurns();
   }
 
-  function getTurns() { return Array.from(document.querySelectorAll(TURN_SELECTOR)); }
-  function getAllTurnNodes() { return hiddenStore.length ? hiddenStore.map(h => h.node).concat(getTurns()) : getTurns(); }
   function getTotalTurns() { return getTurns().length + hiddenStore.length; }
 
-  // ----- tokens -----
   function formatTokens(n) {
     if (n == null) return '…';
     if (n >= 1e6)  return (n / 1e6).toFixed(n % 1e6 >= 1e5 ? 1 : 0) + 'M';
     if (n >= 1e3)  return (n / 1e3).toFixed(n % 1e3 >= 100 ? 1 : 0) + 'k';
     return String(n);
   }
+
   function countSpaces(text) {
+    // Count space, tab, line breaks and NBSP
     let c = 0;
     for (let i = 0; i < text.length; i++) {
       const ch = text.charCodeAt(i);
@@ -157,6 +151,7 @@
     }
     return c;
   }
+
   function tokensForNode(node) {
     let rec = tokenCache.get(node);
     if (!rec || rec.dirty) {
@@ -167,6 +162,7 @@
     }
     return rec.tokens;
   }
+
   function sumTokensForNodes(nodes, done) {
     let sum = 0, i = 0;
     (function step() {
@@ -187,6 +183,7 @@
       done(sum);
     })();
   }
+
   function scheduleTokens(kind) {
     if (kind === 'visible' || kind === 'both') wantTokensVisible = true;
     if (kind === 'total'   || kind === 'both') wantTokensTotal   = true;
@@ -194,9 +191,12 @@
     tokenJobQueued = true;
     setTimeout(runTokenJob, 0);
   }
+
   function runTokenJob() {
     tokenJobQueued = false;
-    if (STREAM_SAFE && isStreaming) return;
+    // HARD PAUSE: skip token work while streaming
+    if (STREAM_HARD_PAUSE && isStreaming) return;
+
     const all = getAllTurnNodes();
     const desired = expanded ? all.length : Math.min(visibleCount, all.length);
     const visibleNodes = all.slice(all.length - desired);
@@ -204,6 +204,7 @@
     const tasks = [];
     if (wantTokensVisible) tasks.push(cb => sumTokensForNodes(visibleNodes, v => { lastTokens.visible = v; cb(); }));
     if (wantTokensTotal)   tasks.push(cb => sumTokensForNodes(all,          v => { lastTokens.total   = v; cb(); }));
+
     wantTokensVisible = wantTokensTotal = false;
 
     (function run(i) {
@@ -211,17 +212,33 @@
       tasks[i](() => setTimeout(() => run(i + 1), 0));
     })(0);
   }
+
   function badgeText() {
     const need = expanded ? 'total' : 'visible';
     const val = lastTokens[need];
     return `[T:// ${formatTokens(val)}]`;
   }
 
-  // ----- scroll/anchor -----
+  function updateButton(totalCached) {
+    ensureButton();
+    const b = document.getElementById(BTN_ID);
+    if (!b) return;
+    const total = (typeof totalCached === 'number') ? totalCached : getTotalTurns();
+    const desired = expanded ? total : Math.min(visibleCount, total);
+    const hidden = Math.max(0, total - desired);
+    const badge = badgeText();
+
+    b.textContent = expanded
+      ? `Show only last ${BATCH} ${badge}`
+      : (hidden > 0 ? `Show ${hidden} older ${badge}` : `Hide older (none) ${badge}`);
+  }
+
   function clearMarksAll() {
     document.querySelectorAll('.lazy-turn-hidden, .lazy-turn-cv')
       .forEach(el => el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv'));
   }
+
+  // ====== Scroll / anchor ======
   function findScrollableAncestor(node) {
     let el = node && node.parentElement;
     while (el && el !== document.documentElement) {
@@ -232,6 +249,7 @@
     }
     return null;
   }
+
   function resolveScrollContainer() {
     const turns = getTurns();
     const probe = turns.length ? turns[turns.length - 1] : document.body;
@@ -245,11 +263,13 @@
       scrollAttachedTo = scrollContainer || null;
     }
   }
+
   function viewportTop() { return scrollContainer ? scrollContainer.getBoundingClientRect().top : 0; }
   function getScrollTop() { return scrollContainer ? scrollContainer.scrollTop : (window.scrollY || document.documentElement.scrollTop || 0); }
   function getScrollHeight() { return scrollContainer ? scrollContainer.scrollHeight : (document.scrollingElement || document.documentElement || document.body).scrollHeight; }
   function scrollByDelta(dy) { if (!dy) return; if (!scrollContainer) window.scrollBy({ top: dy, left: 0, behavior: 'auto' }); else scrollContainer.scrollTop += dy; }
   function scrollToBottom() { const h = getScrollHeight(); if (!scrollContainer) window.scrollTo({ top: h, behavior: 'auto' }); else scrollContainer.scrollTop = h; }
+
   function findAnchorElement() {
     const vt = viewportTop();
     const turns = getTurns();
@@ -259,6 +279,7 @@
     }
     return turns[0] || null;
   }
+
   function withAnchor(preserve, action) {
     if (!preserve) { action(); return; }
     resolveScrollContainer();
@@ -273,7 +294,7 @@
     }
   }
 
-  // ----- detach helpers -----
+  // ====== Detach helpers ======
   function restoreSome(count) {
     if (!count) return;
     const start = Math.max(0, hiddenStore.length - count);
@@ -283,6 +304,7 @@
       if (placeholder && placeholder.isConnected) placeholder.replaceWith(node);
     });
   }
+
   function detachFirstN(turns, n) {
     if (n <= 0) return 0;
     const limit = Math.min(n, MAX_DETACH_PER_TICK);
@@ -298,45 +320,11 @@
     return limit;
   }
 
-  // ----- streaming soft fold -----
-  function softFoldDuringStream() {
-    if (!STREAM_SAFE || !isStreaming) return;
-    const turns = getTurns();
-    const total = turns.length + hiddenStore.length;
-    const desired = expanded ? total : Math.min(visibleCount, total);
-    const cutoff  = Math.max(0, turns.length - desired);
-
-    // clean visible tail
-    for (let i = turns.length - desired; i < turns.length; i++) {
-      const el = turns[i];
-      if (!el) continue;
-      if (el.classList.contains('lazy-turn-hidden') || el.classList.contains('lazy-turn-cv')) {
-        el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv');
-      }
-    }
-    // fold head chunked
-    let idx = 0;
-    (function step() {
-      if (!isStreaming || !STREAM_SAFE) return;
-      const end = Math.min(idx + STREAM_SOFT_CHUNK, cutoff);
-      for (let i = idx; i < end; i++) {
-        const el = turns[i];
-        if (!el) continue;
-        el.classList.remove('lazy-turn-hidden');
-        if (!el.classList.contains('lazy-turn-cv')) el.classList.add('lazy-turn-cv');
-      }
-      idx = end;
-      if (idx < cutoff) setTimeout(step, 0);
-    })();
-  }
-  function scheduleSoftFoldDuringStream() {
-    if (!STREAM_SAFE || !isStreaming || softJobScheduled) return;
-    softJobScheduled = true;
-    setTimeout(() => { softJobScheduled = false; softFoldDuringStream(); }, 100);
-  }
-
-  // ----- main apply (non-stream) -----
+  // ====== Main logic (skips entirely during streaming HARD PAUSE) ======
   function apply({ preserveAnchor = false, force = false } = {}) {
+    // HARD PAUSE: absolutely no DOM work while streaming
+    if (STREAM_HARD_PAUSE && isStreaming) return;
+
     resolveScrollContainer();
 
     const turnsNow = getTurns();
@@ -359,7 +347,7 @@
       });
       lastMetrics = { total, desiredVisible: desired, mode: MODE, expanded };
       updateButton(total);
-      scheduleTokens('total');
+      scheduleTokens('total'); // recompute tokens for total
       return;
     }
 
@@ -388,89 +376,93 @@
         for (let i = turns.length - desired; i < turns.length; i++) {
           const el = turns[i];
           if (!el) continue;
-          el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv');
+          if (el.classList.contains('lazy-turn-hidden') || el.classList.contains('lazy-turn-cv')) {
+            el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv');
+          }
         }
         for (let i = 0; i < cutoff; i++) {
           const el = turns[i];
           if (!el) continue;
-          if (MODE === 'hide') el.classList.add('lazy-turn-hidden');
-          else if (MODE === 'cv') el.classList.add('lazy-turn-cv');
+          if (MODE === 'hide') {
+            if (!el.classList.contains('lazy-turn-hidden')) el.classList.add('lazy-turn-hidden');
+          } else if (MODE === 'cv') {
+            if (!el.classList.contains('lazy-turn-cv')) el.classList.add('lazy-turn-cv');
+          }
         }
       });
     }
 
     lastMetrics = { total, desiredVisible: desired, mode: MODE, expanded };
     updateButton(total);
-    scheduleTokens('visible');
+    scheduleTokens('visible'); // recompute tokens for visible part
   }
 
-  // ----- infinite reveal up -----
+  // ====== Upward infinite reveal ======
   function revealMoreUp() {
     if (expanded) return;
+    // HARD PAUSE: no reveals during streaming
+    if (STREAM_HARD_PAUSE && isStreaming) return;
+
     const total = getTotalTurns();
     const desired = Math.min(visibleCount + BATCH, total);
     if (desired === visibleCount || isRevealing) return;
 
     isRevealing = true;
     visibleCount = desired;
-
-    if (STREAM_SAFE && isStreaming) {
-      scheduleSoftFoldDuringStream();
-      scheduleTokens('visible');
-    } else {
-      apply({ preserveAnchor: true, force: true });
-    }
+    apply({ preserveAnchor: true, force: true });
     requestAnimationFrame(() => { isRevealing = false; });
   }
+
   function onScroll() {
     if (expanded) return;
     if (getScrollTop() <= TOP_REVEAL_THRESHOLD) revealMoreUp();
   }
 
-  // ----- toggle -----
+  // ====== Toggle ======
   function toggle() {
+    // HARD PAUSE: ignore toggle clicks during streaming to avoid DOM work
+    if (STREAM_HARD_PAUSE && isStreaming) return;
+
     expanded = !expanded;
-    if (expanded && (STREAM_SAFE && isStreaming)) {
-      clearMarksAll();
-      updateButton(); scheduleTokens('total');
-    } else {
-      if (!expanded) {
-        visibleCount = BATCH;
-        requestAnimationFrame(scrollToBottom);
-      }
-      apply({ preserveAnchor: false, force: true });
+    if (!expanded) {
+      visibleCount = BATCH;
+      requestAnimationFrame(scrollToBottom);
     }
+    apply({ preserveAnchor: false, force: true });
   }
 
-  // =========================
-  // Streaming detection & observer
-  // =========================
+  // ====== Observe & boot ======
   function recomputeStreamingFlag() {
     const hard = hasStopButton();
+
     if (hard) {
-      if (!isStreaming) { isStreaming = true; scheduleSoftFoldDuringStream(); }
+      if (!isStreaming) {
+        isStreaming = true;
+        // While streaming we intentionally do nothing.
+        // No apply(), no tokens, no reveals. Just wait.
+      }
       if (streamFlipTimer) { clearTimeout(streamFlipTimer); streamFlipTimer = null; }
       return;
     }
+
+    // Stop button disappeared → exit streaming after a small cooldown
     if (isStreaming && !streamFlipTimer) {
       streamFlipTimer = setTimeout(() => {
         isStreaming = false;
         streamFlipTimer = null;
+        // After streaming ends — run one full pass and token recompute
         apply({ preserveAnchor: true, force: true });
         scheduleTokens('both');
       }, STREAM_OFF_COOLDOWN);
     }
   }
+
   function attachObserver(root) {
     if (observer) observer.disconnect();
     observer = new MutationObserver(
       debounce(() => {
-        recomputeStreamingFlag();
-        if (STREAM_SAFE && isStreaming) {
-          scheduleSoftFoldDuringStream();
-          updateButton();
-          return;
-        }
+        // HARD PAUSE: if streaming, ignore DOM mutations entirely
+        if (STREAM_HARD_PAUSE && isStreaming) return;
         apply({ preserveAnchor: false });
       }, OBS_DEBOUNCE_MS)
     );
@@ -482,6 +474,7 @@
       observerRoot = document.documentElement;
     }
   }
+
   function pickFeedRoot() {
     return document.querySelector('[role="feed"]') ||
            document.querySelector('main [role="feed"]') ||
@@ -490,79 +483,24 @@
            document.documentElement;
   }
 
-  // =========================
-  // FULL reload only for sidebar links (fix model picker)
-  // =========================
-  const SIDEBAR_SCOPE_SEL = 'nav[aria-label="Chat history"], #history, [class*="sidebar-width"]';
-
-  function isInsideSidebar(node) {
-    return !!(node && node.closest(SIDEBAR_SCOPE_SEL));
-  }
-
-  function isInternalHref(href) {
-    if (!href) return false;
-    if (/^(mailto:|javascript:|data:)/i.test(href)) return false;
-    if (href.startsWith('#')) return false;
-    if (href.startsWith('/')) return true;
-    try { return new URL(href, location.origin).origin === location.origin; }
-    catch { return false; }
-  }
-
-  // Do NOT hijack clicks on buttons inside the menu row (folder toggle, triple-dot, etc.)
-  function clickIsOnMenuRowButton(target) {
-    return !!target.closest('a .icon button, a [data-trailing-button], .__menu-item-trailing-btn, button');
-  }
-
-  // Single source of truth: force navigation only if click happened in the sidebar scope.
-  document.addEventListener('click', (ev) => {
-    if (ev.defaultPrevented) return;
-    if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
-
-    const t = ev.target;
-    const link = t && t.closest && t.closest('a[href]');
-    if (!link) return;
-
-    // Restrict to left sidebar only.
-    if (!isInsideSidebar(t)) return;
-
-    // Let folder toggle icon / trailing buttons work normally.
-    if (clickIsOnMenuRowButton(t)) return;
-
-    const href = link.getAttribute('href');
-    if (!isInternalHref(href)) return;
-    if (link.target === '_blank') return;
-
-    // Force full-page reload to avoid SPA leftovers.
-    try { sessionStorage.setItem('lcpp_pending_nav', '1'); } catch {}
-    ev.preventDefault();
-    location.assign(href);
-  }, true);
-
-  // Cleanup pending flag on load (best-effort).
-  try { sessionStorage.removeItem('lcpp_pending_nav'); } catch {}
-
-  // =========================
-  // Boot
-  // =========================
   function boot() {
     ensureStyle();
     ensureButton();
 
     attachObserver(pickFeedRoot());
 
-    // initial fold
+    // Initial fold
     apply({ preserveAnchor: false, force: true });
     scheduleTokens('visible');
 
-    // periodic streaming poll
-    setInterval(recomputeStreamingFlag, 300);
+    // Streaming polling ONLY (every 500 ms)
+    setInterval(recomputeStreamingFlag, STREAM_POLL_MS);
 
-    // SPA init poll (kept small)
+    // SPA/pending init poll (kept as-is; respects HARD PAUSE via apply guard)
     let tries = 80;
     const poll = setInterval(() => {
       const root = pickFeedRoot();
       if (root && root !== observerRoot) attachObserver(root);
-      recomputeStreamingFlag();
       if (!isStreaming) apply({ preserveAnchor: false });
       if (getTurns().length > 0 || --tries <= 0) clearInterval(poll);
     }, 250);
