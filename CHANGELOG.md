@@ -4,6 +4,17 @@ All notable changes to **ChatGPT Lazy Chat++** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] - 2025-09-18
+### Changed
+- **Idle-batched apply:** MutationObserver events are now coalesced and processed via `requestIdleCallback` (with a 50–80 ms timeout fallback) instead of immediate synchronous runs.  
+- **Token recomputation throttled:** tokens are recalculated only on key events (post-stream, toggle, reveal, initial boot), with a light 50 ms delay to avoid spikes during typing.  
+- **HARD PAUSE preserved:** while the Stop button is visible, no DOM or token work is performed; only a lightweight Stop-button poll every 500 ms.  
+
+### Fixed
+- Eliminated excessive `requestAnimationFrame` loops and reduced layout thrash (`ResizeObserver` warnings).  
+- Removed continuous token counting on input, resolving freezes while typing.  
+- Reduced main-thread stalls by batching DOM mutations and deferring heavy operations until idle time.  
+
 ## [1.0.5] - 2025-09-15
 ### Changed
 - **HARD PAUSE during streaming:** while the Stop button is visible, the script does **no DOM work at all** (no folding, no reveals, no token updates). Only a lightweight poll of the Stop-button state every **500 ms**.
