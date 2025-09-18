@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ChatGPT Lazy Chat++ (stream-safe + tokens badge)
+// @name         ChatGPT Lazy Chat++ (HARD PAUSE + idle batching)
 // @namespace    chatgpt-lazy
-// @version      1.0.6
-// @description  Keeps only the last N chat turns visible with smooth upward reveal. HARD PAUSE during streaming (no DOM work at all). Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
+// @version      1.0.8
+// @description  Keeps only the last N chat turns visible with smooth upward reveal. HARD PAUSE during streaming (no DOM work at all). Idle-batched apply. Tokens recompute only post-stream & on reveal/toggle. Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
 // @supportURL   https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus/issues
@@ -44,7 +44,6 @@
 
   // Anti-freeze chunking (kept for non-streaming ops)
   const MAX_DETACH_PER_TICK = 50;
-  const STREAM_SOFT_CHUNK   = 40;    // ignored under HARD_PAUSE
 
   // Turn nodes
   const TURN_SELECTOR = [
@@ -81,7 +80,19 @@
   // Streaming state
   let isStreaming = false;
   let streamFlipTimer = null;
-  let softJobScheduled = false;
+
+  // Idle batching for apply()
+  let applyIdleHandle = null;
+  let applyTimeoutHandle = null;
+  let pendingApply = null; // {preserveAnchor, force, tokenHint}
+  // TokenHint semantics: null=no token work; 'visible'|'total'|'both'
+  function mergeTokenHints(a, b) {
+    if (!a) return b || null;
+    if (!b) return a;
+    if (a === 'both' || b === 'both') return 'both';
+    if ((a === 'visible' && b === 'total') || (a === 'total' && b === 'visible')) return 'both';
+    return a; // same kind
+  }
 
   // =========================
   // Token estimator (≈1.3×spaces)
@@ -90,7 +101,7 @@
   const TOKENS_PER_TICK = 20;
   const tokenCache = new WeakMap(); // WeakMap<Node, {tokens:number, dirty?:boolean}>
   const lastTokens = { visible: null, total: null };
-  let wantTokensVisible = false, wantTokensTotal = false, tokenJobQueued = false;
+  let tokenJobQueued = false;
 
   // =========================
   // Utils
@@ -197,25 +208,30 @@
       done(sum);
     })();
   }
+
+  // tokens: recalc only when explicitly hinted (post-stream, reveal, toggle, initial boot)
   function scheduleTokens(kind) {
-    if (kind === 'visible' || kind === 'both') wantTokensVisible = true;
-    if (kind === 'total'   || kind === 'both') wantTokensTotal   = true;
     if (tokenJobQueued) return;
     tokenJobQueued = true;
-    setTimeout(runTokenJob, 0);
+    setTimeout(() => runTokenJob(kind), 50); // light throttle to avoid typing spikes
   }
-  function runTokenJob() {
+  function runTokenJob(kind) {
     tokenJobQueued = false;
-    // HARD PAUSE: skip any token work while streaming.
+    // HARD PAUSE: no token work while streaming.
     if ((STREAM_SAFE || HARD_PAUSE) && isStreaming) return;
+
     const all = getAllTurnNodes();
     const desired = expanded ? all.length : Math.min(visibleCount, all.length);
     const visibleNodes = all.slice(all.length - desired);
 
+    const needVisible = (kind === 'visible' || kind === 'both' || (kind == null && !expanded));
+    const needTotal   = (kind === 'total'   || kind === 'both' || (kind == null && expanded));
+
     const tasks = [];
-    if (wantTokensVisible) tasks.push(cb => sumTokensForNodes(visibleNodes, v => { lastTokens.visible = v; cb(); }));
-    if (wantTokensTotal)   tasks.push(cb => sumTokensForNodes(all,          v => { lastTokens.total   = v; cb(); }));
-    wantTokensVisible = wantTokensTotal = false;
+    if (needVisible) tasks.push(cb => sumTokensForNodes(visibleNodes, v => { lastTokens.visible = v; cb(); }));
+    if (needTotal)   tasks.push(cb => sumTokensForNodes(all,          v => { lastTokens.total   = v; cb(); }));
+
+    if (!tasks.length) { updateButton(); return; }
 
     (function run(i) {
       if (i >= tasks.length) { updateButton(); return; }
@@ -309,49 +325,8 @@
     return limit;
   }
 
-  // ----- streaming helpers (disabled under HARD PAUSE) -----
-  function softFoldDuringStream() {
-    // Under HARD PAUSE we avoid any DOM mutations entirely.
-    if (HARD_PAUSE) return;
-    if (!STREAM_SAFE || !isStreaming) return;
-
-    const turns = getTurns();
-    const total = turns.length + hiddenStore.length;
-    const desired = expanded ? total : Math.min(visibleCount, total);
-    const cutoff  = Math.max(0, turns.length - desired);
-
-    // clean visible tail
-    for (let i = turns.length - desired; i < turns.length; i++) {
-      const el = turns[i];
-      if (!el) continue;
-      if (el.classList.contains('lazy-turn-hidden') || el.classList.contains('lazy-turn-cv')) {
-        el.classList.remove('lazy-turn-hidden', 'lazy-turn-cv');
-      }
-    }
-    // fold head chunked
-    let idx = 0;
-    (function step() {
-      if (!isStreaming || !STREAM_SAFE) return;
-      const end = Math.min(idx + STREAM_SOFT_CHUNK, cutoff);
-      for (let i = idx; i < end; i++) {
-        const el = turns[i];
-        if (!el) continue;
-        el.classList.remove('lazy-turn-hidden');
-        if (!el.classList.contains('lazy-turn-cv')) el.classList.add('lazy-turn-cv');
-      }
-      idx = end;
-      if (idx < cutoff) setTimeout(step, 0);
-    })();
-  }
-  function scheduleSoftFoldDuringStream() {
-    if (HARD_PAUSE) return;
-    if (!STREAM_SAFE || !isStreaming || softJobScheduled) return;
-    softJobScheduled = true;
-    setTimeout(() => { softJobScheduled = false; softFoldDuringStream(); }, 100);
-  }
-
   // ----- main apply (non-stream) -----
-  function apply({ preserveAnchor = false, force = false } = {}) {
+  function apply({ preserveAnchor = false, force = false, tokenHint = null } = {}) {
     // HARD PAUSE: don't touch DOM while streaming.
     if (HARD_PAUSE && isStreaming) return;
 
@@ -367,6 +342,7 @@
         lastMetrics.mode === MODE &&
         lastMetrics.expanded === expanded) {
       updateButton(total);
+      if (tokenHint) scheduleTokens(tokenHint);
       return;
     }
 
@@ -377,7 +353,7 @@
       });
       lastMetrics = { total, desiredVisible: desired, mode: MODE, expanded };
       updateButton(total);
-      scheduleTokens('total');
+      if (tokenHint) scheduleTokens(tokenHint);
       return;
     }
 
@@ -394,7 +370,7 @@
         const needDetach = Math.max(0, afterRestoreVisible - desired);
         if (needDetach > 0) {
           const did = detachFirstN(getTurns(), needDetach);
-          if (needDetach > did) setTimeout(() => apply({ preserveAnchor: true, force: true }), 0);
+          if (needDetach > did) scheduleApply({ preserveAnchor: true, force: true, tokenHint });
         }
       });
 
@@ -419,7 +395,38 @@
 
     lastMetrics = { total, desiredVisible: desired, mode: MODE, expanded };
     updateButton(total);
-    scheduleTokens('visible');
+    if (tokenHint) scheduleTokens(tokenHint);
+  }
+
+  // ----- idle-batched scheduler for apply() -----
+  function scheduleApply(opts) {
+    if (HARD_PAUSE && isStreaming) return;
+    // merge options with pending
+    if (!pendingApply) pendingApply = { preserveAnchor: false, force: false, tokenHint: null };
+    pendingApply.preserveAnchor = pendingApply.preserveAnchor || !!opts.preserveAnchor;
+    pendingApply.force = pendingApply.force || !!opts.force;
+    pendingApply.tokenHint = mergeTokenHints(pendingApply.tokenHint, opts.tokenHint || null);
+
+    // already scheduled
+    if (applyIdleHandle || applyTimeoutHandle) return;
+
+    const run = () => {
+      applyIdleHandle = null;
+      applyTimeoutHandle = null;
+      const payload = pendingApply; pendingApply = null;
+      apply(payload || {});
+    };
+
+    // prefer idle callback with a timeout fallback to avoid starvation
+    if ('requestIdleCallback' in window) {
+      try {
+        applyIdleHandle = requestIdleCallback(run, { timeout: 80 });
+      } catch {
+        applyTimeoutHandle = setTimeout(run, 50);
+      }
+    } else {
+      applyTimeoutHandle = setTimeout(run, 50);
+    }
   }
 
   // ----- infinite reveal up -----
@@ -434,13 +441,7 @@
     isRevealing = true;
     visibleCount = desired;
 
-    if (STREAM_SAFE && isStreaming) {
-      // Under HARD PAUSE this path won't execute (guard above).
-      scheduleSoftFoldDuringStream();
-      scheduleTokens('visible');
-    } else {
-      apply({ preserveAnchor: true, force: true });
-    }
+    scheduleApply({ preserveAnchor: true, force: true, tokenHint: 'visible' });
     requestAnimationFrame(() => { isRevealing = false; });
   }
   function onScroll() {
@@ -453,15 +454,12 @@
     if (HARD_PAUSE && isStreaming) return; // block toggles during streaming
 
     expanded = !expanded;
-    if (expanded && (STREAM_SAFE && isStreaming) && !HARD_PAUSE) {
-      clearMarksAll();
-      updateButton(); scheduleTokens('total');
+    if (!expanded) {
+      visibleCount = BATCH;
+      requestAnimationFrame(scrollToBottom);
+      scheduleApply({ preserveAnchor: false, force: true, tokenHint: 'visible' });
     } else {
-      if (!expanded) {
-        visibleCount = BATCH;
-        requestAnimationFrame(scrollToBottom);
-      }
-      apply({ preserveAnchor: false, force: true });
+      scheduleApply({ preserveAnchor: false, force: true, tokenHint: 'total' });
     }
   }
 
@@ -486,8 +484,7 @@
         isStreaming = false;
         streamFlipTimer = null;
         // One full recompute after stream ends.
-        apply({ preserveAnchor: true, force: true });
-        scheduleTokens('both');
+        scheduleApply({ preserveAnchor: true, force: true, tokenHint: 'both' });
       }, STREAM_OFF_COOLDOWN);
     }
   }
@@ -498,8 +495,8 @@
       debounce(() => {
         // HARD PAUSE: ignore all mutations while streaming.
         if (HARD_PAUSE && isStreaming) return;
-        // No streaming recompute here: Stop-button status is polled separately.
-        apply({ preserveAnchor: false });
+        // Batch mutations via idle scheduler; no token work from generic mutations.
+        scheduleApply({ preserveAnchor: false, force: false });
       }, OBS_DEBOUNCE_MS)
     );
     try {
@@ -585,9 +582,8 @@
 
     attachObserver(pickFeedRoot());
 
-    // initial fold
-    apply({ preserveAnchor: false, force: true });
-    scheduleTokens('visible');
+    // initial fold + initial tokens for visible portion
+    apply({ preserveAnchor: false, force: true, tokenHint: 'visible' });
 
     // HARD PAUSE: lightweight poll of Stop-button every HARD_POLL_MS
     setInterval(recomputeStreamingFlag, HARD_POLL_MS);
@@ -598,7 +594,8 @@
     const poll = setInterval(() => {
       const root = pickFeedRoot();
       if (root && root !== observerRoot) attachObserver(root);
-      if (!isStreaming) apply({ preserveAnchor: false });
+      // Only schedule lightweight, no-token apply outside streaming
+      if (!isStreaming) scheduleApply({ preserveAnchor: false });
       if (getTurns().length > 0 || --tries <= 0) clearInterval(poll);
     }, 250);
   }
