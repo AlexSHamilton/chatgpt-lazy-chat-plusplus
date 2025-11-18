@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Lazy Chat++ (HARD PAUSE + idle batching)
 // @namespace    chatgpt-lazy
-// @version      1.0.8
+// @version      1.0.9
 // @description  Keeps only the last N chat turns visible with smooth upward reveal. HARD PAUSE during streaming (no DOM work at all). Idle-batched apply. Tokens recompute only post-stream & on reveal/toggle. Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces).
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
@@ -21,6 +21,20 @@
  * ChatGPT Lazy Chat++ — Userscript
  * Copyright (C) 2025 Alex S Hamilton
  */
+
+// Normal Copy on ChatGPT
+
+(function () {
+  const forceNormalCopy = (e) => {
+    e.stopImmediatePropagation();
+    return true;
+  };
+
+  ['copy', 'cut'].forEach(event => {
+    document.addEventListener(event, forceNormalCopy, true);
+  });
+})();
+
 
 (function () {
   'use strict';
