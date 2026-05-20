@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Lazy Chat++ (HARD PAUSE + idle batching + translate layout patch)
 // @namespace    chatgpt-lazy
-// @version      1.1.0
+// @version      1.1.1
 // @description  Keeps only the last N chat turns visible with smooth upward reveal. HARD PAUSE during streaming (no DOM work at all). Idle-batched apply. Tokens recompute only post-stream & on reveal/toggle. Modes: hide | detach | cv. Button shows estimated tokens as [T:// …] (≈1.3 × spaces). On /translate the lazy-chat logic is disabled and a dedicated responsive layout patch is applied.
 // @author       AlexSHamilton
 // @homepage     https://github.com/AlexSHamilton/chatgpt-lazy-chat-plusplus
@@ -609,14 +609,22 @@
       else scrollContainer.scrollTop = h;
     }
 
+    function isVisible(el) {
+      // In hide mode elements get display:none — their rects are all zeros
+      if (MODE === 'hide' && el.classList.contains('lazy-turn-hidden')) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 || r.height > 0;
+    }
+
     function findAnchorElement() {
       const vt = viewportTop();
       const turns = getTurns();
       for (const el of turns) {
+        if (!isVisible(el)) continue;
         const r = el.getBoundingClientRect();
         if (r.bottom > vt + 1) return el;
       }
-      return turns[0] || null;
+      return turns.find(isVisible) || null;
     }
 
     function withAnchor(preserve, action) {
@@ -629,7 +637,8 @@
       const anchor = findAnchorElement();
       const baseTop = anchor ? (anchor.getBoundingClientRect().top - vt) : null;
       action();
-      if (anchor && anchor.isConnected && baseTop != null) {
+      // Skip correction if anchor became hidden after action (hide mode)
+      if (anchor && anchor.isConnected && baseTop != null && isVisible(anchor)) {
         const newTop = anchor.getBoundingClientRect().top - vt;
         const dy = newTop - baseTop;
         if (dy) scrollByDelta(dy * -1);
@@ -778,13 +787,14 @@
       visibleCount = desired;
 
       scheduleApply({ preserveAnchor: true, force: true, tokenHint: 'visible' });
-      requestAnimationFrame(() => { isRevealing = false; });
+      // Reset after idle callback has had time to run (rAF fires too early, ~16ms)
+      setTimeout(() => { isRevealing = false; }, 150);
     }
 
-    function onScroll() {
+    const onScroll = debounce(() => {
       if (expanded) return;
       if (getScrollTop() <= TOP_REVEAL_THRESHOLD) revealMoreUp();
-    }
+    }, 80);
 
     // ----- toggle -----
     function toggle() {
