@@ -328,7 +328,7 @@
     // =========================
     // Settings
     // =========================
-    const MODE = 'detach';            // 'hide' | 'detach' | 'cv'
+    const MODE = 'hide';            // 'hide' | 'detach' | 'cv'
     const BATCH = 8;                  // upward auto-reveal batch size
     const OBS_DEBOUNCE_MS = 250;
     const TOP_REVEAL_THRESHOLD = 120; // px from top to trigger reveal
